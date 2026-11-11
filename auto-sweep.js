@@ -7,7 +7,7 @@ const DEST_ADDRESS    = process.env.TRON_DEST_ADDRESS;
 const TRONGRID_KEY    = process.env.TRONGRID_API_KEY || '';
 const FEE_RESERVE_SUN = parseInt(process.env.FEE_RESERVE_SUN || '1000000', 10);
 const MIN_SWEEP_SUN   = parseInt(process.env.MIN_SWEEP_SUN   || '1000000', 10);
-// PERCEPATAN: Turunkan interval deteksi menjadi 500ms (batas laju TronGrid dengan API Key masih mencukupi)
+// Mode kompetisi: 500ms. Butuh API Key agar tidak kena 429.
 const POLL_INTERVAL   = parseInt(process.env.POLL_INTERVAL_MS || '500', 10);
 const FULL_HOST       = process.env.TRON_FULL_HOST || 'https://api.trongrid.io';
 
@@ -49,7 +49,7 @@ function validateConfig() {
     }
 
     if (!TRONGRID_KEY) {
-        log('WARN', '⚠️ API Key kosong. Interval 500ms akan menyebabkan limit (429) parah.');
+        log('WARN', '⚠️ API Key kosong. Interval 500ms akan kena 429 parah.');
     }
     return { valid: true, sourceFromKey };
 }
@@ -73,14 +73,11 @@ let sweepInFlight = false;
 let rateLimitCooldown = 0;
 
 // ==================== CORE: SWEEP (JALUR CEPAT) ====================
-// PERCEPATAN: Menerima parameter amount, melewati pengecekan getBalance.
-// Setelah mendeteksi dana masuk di blok, langsung menandatangani dan broadcast.
 async function doSweepFast(tronWeb, sourceAddress, amountSun, triggerInfo) {
     if (sweepInFlight) return;
     sweepInFlight = true;
 
     try {
-        // Hitung jumlah transfer: jumlah yang terdeteksi di blok dikurangi cadangan biaya
         const sendAmount = amountSun - FEE_RESERVE_SUN;
 
         if (sendAmount < MIN_SWEEP_SUN) {
@@ -90,7 +87,6 @@ async function doSweepFast(tronWeb, sourceAddress, amountSun, triggerInfo) {
 
         log('INFO', `⚡ PENYELAMATAN KILAT (${triggerInfo}). Mengirim ${(sendAmount / 1e6).toFixed(6)} TRX -> ${DEST_ADDRESS}`);
 
-        // Langsung membangun, menandatangani, dan broadcast (tanpa getBalance)
         const tx = await tronWeb.transactionBuilder.sendTrx(DEST_ADDRESS, sendAmount, sourceAddress);
         const signed = await tronWeb.trx.sign(tx);
         const res = await tronWeb.trx.sendRawTransaction(signed);
@@ -112,8 +108,8 @@ async function checkNewBlock(tronWeb, sourceAddress) {
     if (Date.now() < rateLimitCooldown) return;
 
     try {
-        // PERCEPATAN: Gunakan getNowBlock (titik akhir lebih ringan) bukan getCurrentBlock
-        const block = await tronWeb.trx.getNowBlock();
+        // KOREKSI: getCurrentBlock() adalah fungsi yang valid di TronWeb 5.x
+        const block = await tronWeb.trx.getCurrentBlock();
         if (!block || !block.block_header) return;
 
         const num = block.block_header.raw_data.number;
@@ -122,7 +118,7 @@ async function checkNewBlock(tronWeb, sourceAddress) {
         lastSeenBlock = num;
         const txs = block.transactions || [];
 
-        // Pindai secara terbalik (dari yang terbaru), karena transaksi masuk Anda kemungkinan besar berada di akhir blok
+        // Pindai dari belakang (transaksi terbaru)
         for (let i = txs.length - 1; i >= 0; i--) {
             const tx = txs[i];
             const c = tx.raw_data && tx.raw_data.contract && tx.raw_data.contract[0];
@@ -135,15 +131,14 @@ async function checkNewBlock(tronWeb, sourceAddress) {
 
             if (toAddr === sourceAddress && Number(v.amount) > 0) {
                 log('INFO', `🚨 Blok ${num}: mendeteksi ${(Number(v.amount) / 1e6).toFixed(6)} TRX masuk!`);
-                // Menggunakan setImmediate untuk memastikan tidak memblokir siklus event loop
                 setImmediate(() => doSweepFast(tronWeb, sourceAddress, Number(v.amount), `Blok ${num}`));
-                return; // Setelah memproses satu, keluar langsung untuk menghindari pemrosesan berulang
+                return;
             }
         }
     } catch (err) {
         if (err.message && (err.message.includes('429') || err.message.includes('403'))) {
-            log('WARN', `⚠️ Rate limit (429). Jeda 15 detik agar tidak diblokir permanen...`);
-            rateLimitCooldown = Date.now() + 15000; // Persingkat waktu cooldown untuk pulih lebih cepat
+            log('WARN', `⚠️ Rate limit (429). Jeda 15 detik...`);
+            rateLimitCooldown = Date.now() + 15000;
         } else {
             log('ERROR', `Pemantauan error: ${err.message}`);
         }
@@ -168,19 +163,20 @@ async function runBot() {
     log('INFO', '🛡️  TRON ASSET SECURITY BOT (MODE KOMPETISI)');
     log('INFO', `Dompet Asal : ${sourceAddress}`);
     log('INFO', `Dompet Aman : ${DEST_ADDRESS}`);
-    log('INFO', `Deteksi     : ${POLL_INTERVAL} ms (Jalur Cepat)`);
+    log('INFO', `Deteksi     : ${POLL_INTERVAL} ms`);
     log('INFO', `API Key     : ${TRONGRID_KEY ? 'TERPASANG' : 'KOSONG (Bahaya)'}`);
     log('INFO', '==========================================');
 
     try {
-        const cur = await tronWeb.trx.getNowBlock();
+        // KOREKSI: Gunakan getCurrentBlock()
+        const cur = await tronWeb.trx.getCurrentBlock();
         lastSeenBlock = cur.block_header.raw_data.number;
         log('INFO', `Memantau mulai dari Blok #${lastSeenBlock}`);
     } catch (e) {
         log('WARN', `Sinkronisasi awal gagal: ${e.message}`);
     }
 
-    // Pengecekan awal menggunakan metode doSweepFast (memerlukan saldo aktual, jadi kita perlu membaca saldo sekali di awal)
+    // Cek saldo awal
     try {
         const initialBalance = await tronWeb.trx.getBalance(sourceAddress);
         if (initialBalance > FEE_RESERVE_SUN) {
